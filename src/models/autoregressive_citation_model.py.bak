@@ -1,0 +1,1078 @@
+import os
+import logging
+import traceback
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data as GraphData
+from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
+
+from src.models.encoder.hyperbolic_encoder import HyperbolicEncoder
+from src.models.predictors.attention_predictor import AttentionPredictor
+from src.models.predictors.autoregressive_predictor import AutoregressiveLinkPredictor
+
+logger = logging.getLogger(__name__)
+
+class AutoregressiveCitationModel(nn.Module):
+    """
+    Integrated model that combines HyperbolicEncoder, AttentionPredictor,
+    and AutoregressiveLinkPredictor for paper generation.
+    
+    This model supports multi-task training for both link prediction 
+    (between unmasked nodes) and paper generation (predicting future papers 
+    after a time threshold) using an autoregressive approach.
+    
+    The key difference from IntegratedCitationModel is that paper generation
+    is treated as a series of link predictions rather than using a 
+    dedicated generative model like CVAE.
+    """
+    
+    def __init__(
+        self,
+        num_nodes: Optional[int] = None,
+        node_feature_dim: Optional[int] = None,
+        embed_dim: int = 128,
+        hidden_dim: int = 256,
+        num_heads: int = 4,
+        edge_dim: Optional[int] = None,
+        use_hierarchical: bool = False,
+        topic_vocab_size: Optional[int] = None,
+        curvature: float = 1.0,
+        dropout: float = 0.2,
+        num_encoder_layers: int = 1,
+        num_predictor_layers: int = 2,
+        ordering_strategy: str = 'citation',
+        temperature: float = 1.0,
+        reveal_ratio: float = 0.3,
+        device_manager: Optional[Any] = None,
+        # Pre-initialized components
+        encoder: Optional[nn.Module] = None,
+        predictor: Optional[nn.Module] = None,
+        autoregressive_predictor: Optional[nn.Module] = None,
+        device: Optional[str] = None
+    ):
+        """
+        Initialize the autoregressive citation model.
+        
+        Args:
+            num_nodes: Number of nodes in the graph
+            node_feature_dim: Dimension of node features
+            embed_dim: Embedding dimension
+            hidden_dim: Hidden dimension
+            num_heads: Number of attention heads
+            edge_dim: Edge feature dimension
+            use_hierarchical: Whether to use hierarchical encoding
+            topic_vocab_size: Size of topic vocabulary
+            curvature: Hyperbolic curvature parameter
+            dropout: Dropout rate
+            num_encoder_layers: Number of layers in the encoder
+            num_predictor_layers: Number of layers in the predictor
+            ordering_strategy: Strategy for ordering autoregressive predictions
+            temperature: Temperature for controlling prediction randomness
+            reveal_ratio: Proportion of links to reveal during training
+            device_manager: Device manager
+            encoder: Pre-initialized encoder component
+            predictor: Pre-initialized predictor component
+            autoregressive_predictor: Pre-initialized autoregressive predictor
+            device: Device to use for model
+        """
+        super().__init__()
+        
+        # Store parameters
+        self.num_nodes = num_nodes
+        self.node_feature_dim = node_feature_dim
+        self.embed_dim = embed_dim
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.edge_dim = edge_dim
+        self.use_hierarchical = use_hierarchical
+        self.curvature = curvature
+        self.dropout = dropout
+        self.ordering_strategy = ordering_strategy
+        self.temperature = temperature
+        self.reveal_ratio = reveal_ratio
+        
+        # Set up device handling
+        self.device_manager = device_manager
+        self.device = device if device is not None else 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        # Initialize components
+        if encoder is not None:
+            self.encoder = encoder
+        else:
+            self.encoder = HyperbolicEncoder(
+                node_dim=node_feature_dim if node_feature_dim is not None else embed_dim,
+                hidden_dim=hidden_dim,
+                embed_dim=embed_dim,
+                num_layers=num_encoder_layers,
+                curvature=curvature,
+                dropout=dropout
+            )
+            
+        if predictor is not None:
+            self.predictor = predictor
+        else:
+            self.predictor = AttentionPredictor(
+                input_dim=embed_dim,
+                hidden_dim=hidden_dim,
+                num_layers=num_predictor_layers,
+                num_heads=num_heads,
+                dropout=dropout
+            )
+            
+        if autoregressive_predictor is not None:
+            self.autoregressive_predictor = autoregressive_predictor
+        else:
+            self.autoregressive_predictor = AutoregressiveLinkPredictor(
+                embed_dim=embed_dim,
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                ordering_strategy=ordering_strategy,
+                temperature=temperature,
+                reveal_ratio=reveal_ratio,
+                node_feature_dim=node_feature_dim
+            )
+            
+        # Feature projection (to project paper features to embedding space)
+        self.feature_projector = nn.Sequential(
+            nn.Linear(node_feature_dim if node_feature_dim is not None else embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, embed_dim)
+        )
+        
+        # Counter for tracking update steps for learning rate schedules
+        self.update_counter = 0
+        
+        # Move to device
+        self.to(self.device)
+        
+    def to_device(self, x):
+        """Move an object to the device where the model is located.
+        
+        Args:
+            x: Object to move to device
+            
+        Returns:
+            Object on the same device as the model
+        """
+        device = next(self.parameters()).device
+        
+        if x is None:
+            return None
+        # Special handling for GraphData which doesn't support non_blocking
+        elif hasattr(x, 'to') and hasattr(x, 'edge_index'):  # Simple check for GraphData
+            return x.to(device)
+        elif isinstance(x, (list, tuple)):
+            return [self.to_device(i) for i in x]
+        elif isinstance(x, dict):
+            return {k: self.to_device(v) for k, v in x.items()}
+        elif hasattr(x, 'to') and callable(getattr(x, 'to')):
+            # Try with non_blocking for better performance if CUDA
+            try:
+                return x.to(device, non_blocking=True) if device.type == 'cuda' else x.to(device)
+            except TypeError:  # Fallback if non_blocking not supported
+                return x.to(device)
+        else:
+            return x
+    
+    def forward(self, graph, task='both'):
+        """
+        Forward pass of the model.
+        
+        Args:
+            graph: Graph data object
+            task: Task to perform ('link_prediction', 'generation', or 'both')
+            
+        Returns:
+            Dictionary of outputs depending on task
+        """
+        # Move graph to device
+        graph = self.to_device(graph)
+        
+        # Run encoder to get node embeddings
+        node_embeddings = self.encoder(graph)
+        
+        outputs = {'node_embeddings': node_embeddings}
+        
+        # Add link prediction if requested
+        if task in ['link_prediction', 'both']:
+            # For link prediction, we don't need to do additional computation here
+            # It will be handled by specific methods like predict_links
+            outputs['link_prediction'] = True
+            
+        # Add generation if requested
+        if task in ['generation', 'both']:
+            # For generation, we'll just note that it's enabled
+            # Actual generation will be done by specific methods
+            outputs['generation'] = True
+            
+        return outputs
+    
+    def predict_links(
+        self,
+        graph: GraphData,
+        src_nodes: Optional[torch.Tensor] = None,
+        dst_nodes: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """
+        Predict links between source and destination nodes.
+        
+        Args:
+            graph: Graph data object
+            src_nodes: Source node indices
+            dst_nodes: Destination node indices
+            
+        Returns:
+            Predicted link probabilities
+        """
+        # Move data to device
+        graph = self.to_device(graph)
+        if src_nodes is not None:
+            src_nodes = self.to_device(src_nodes)
+        if dst_nodes is not None:
+            dst_nodes = self.to_device(dst_nodes)
+            
+        # Get node embeddings
+        node_embeddings = self.encoder(graph)
+        
+        # If no specific nodes are provided, use all nodes
+        if src_nodes is None or dst_nodes is None:
+            adj_matrix = self.predictor.predict_adjacency(node_embeddings)
+            return adj_matrix
+            
+        # Get source and destination embeddings
+        src_embeddings = node_embeddings[src_nodes]
+        dst_embeddings = node_embeddings[dst_nodes]
+        
+        # Predict links
+        scores = self.predictor(src_embeddings, dst_embeddings)
+        
+        # Apply sigmoid to get probabilities
+        probs = torch.sigmoid(scores)
+        
+        return probs
+    
+    def predict_adjacency_matrix(self, graph: GraphData) -> torch.Tensor:
+        """
+        Predict adjacency matrix for the graph.
+        
+        Args:
+            graph: Graph data object
+            
+        Returns:
+            Adjacency matrix with link probabilities
+        """
+        # Move graph to device
+        graph = self.to_device(graph)
+        
+        # Get node embeddings
+        node_embeddings = self.encoder(graph)
+        
+        # Predict adjacency matrix
+        adj_matrix = self.predictor.predict_adjacency(node_embeddings)
+        
+        return adj_matrix
+    
+    def generate_future_papers_autoregressive(
+        self,
+        graph: GraphData,
+        time_threshold: Optional[float] = None,
+        future_window: Optional[float] = None,
+        num_papers: int = 10,
+        paper_features: Optional[torch.Tensor] = None,
+        top_k: Optional[int] = None,
+        threshold: float = 0.5,
+        temperature: Optional[float] = None
+    ) -> Tuple[torch.Tensor, List[Dict[str, Any]]]:
+        """
+        Generate future papers using autoregressive link prediction.
+        
+        This method treats paper generation as a series of link predictions,
+        where we first obtain paper features (either provided or randomly generated)
+        and then predict links autoregressively.
+        
+        Args:
+            graph: The complete citation network graph
+            time_threshold: Time threshold to separate past and future papers
+            future_window: Time window for future papers
+            num_papers: Number of papers to generate
+            paper_features: Optional features for the papers to generate
+            top_k: If provided, keep only top k links per paper
+            threshold: Probability threshold for binary predictions
+            temperature: Temperature for controlling randomness (overrides model default)
+            
+        Returns:
+            Tuple containing:
+            - Generated paper features [num_papers, feature_dim]
+            - List of paper information dictionaries including citation probabilities
+        """
+        device = next(self.parameters()).device
+        logger.info(f"Generating {num_papers} future papers autoregressively")
+        
+        # Move graph to device
+        graph = self.to_device(graph)
+        
+        # Default time threshold to median timestamp if not provided
+        if time_threshold is None:
+            if hasattr(graph, 'timestamps') and graph.timestamps is not None:
+                time_threshold = torch.median(graph.timestamps).item()
+                logger.info(f"Using median timestamp {time_threshold} as time threshold")
+            else:
+                time_threshold = 0.5  # Fallback
+                logger.warning(f"No timestamps found in graph, using default threshold {time_threshold}")
+        
+        # Default future window if not provided
+        if future_window is None:
+            if hasattr(graph, 'timestamps') and graph.timestamps is not None:
+                future_window = (torch.max(graph.timestamps) - torch.min(graph.timestamps)).item() * 0.1
+                logger.info(f"Using calculated future window of {future_window}")
+            else:
+                future_window = 0.1  # Fallback
+                logger.warning(f"No timestamps found in graph, using default future window {future_window}")
+        
+        try:
+            # Create past graph (papers before time_threshold)
+            if hasattr(graph, 'timestamps') and graph.timestamps is not None:
+                past_mask = graph.timestamps <= time_threshold
+                past_indices = torch.where(past_mask)[0]
+                
+                past_graph = graph.subgraph(past_indices)
+                logger.info(f"Created past graph with {past_indices.size(0)} nodes")
+            else:
+                # If no timestamps, use all nodes as past data
+                past_graph = graph
+                logger.warning("No timestamps available, using entire graph as past data")
+            
+            # Encode past graph to get node embeddings
+            with torch.no_grad():
+                node_embeddings = self.encoder(past_graph)
+                logger.info(f"Encoded past graph, obtained embeddings of shape {node_embeddings.shape}")
+            
+            # If paper_features not provided, generate random features
+            if paper_features is None:
+                # For autoregressive approach, we need plausible features
+                # Here we'll use random interpolation between existing features
+                if hasattr(past_graph, 'x') and past_graph.x is not None:
+                    # Get random pairs of existing nodes
+                    num_nodes = past_graph.x.size(0)
+                    idx1 = torch.randint(0, num_nodes, (num_papers,), device=device)
+                    idx2 = torch.randint(0, num_nodes, (num_papers,), device=device)
+                    
+                    # Interpolate between their features
+                    alpha = torch.rand(num_papers, 1, device=device)
+                    paper_features = alpha * past_graph.x[idx1] + (1 - alpha) * past_graph.x[idx2]
+                    
+                    # Add some noise for diversity
+                    noise = torch.randn_like(paper_features) * 0.1
+                    paper_features = paper_features + noise
+                    
+                    # Ensure features are valid (e.g., in [0, 1] for normalized features)
+                    paper_features = torch.clamp(paper_features, 0, 1)
+                else:
+                    # If no features available, create random features
+                    feature_dim = past_graph.num_node_features if hasattr(past_graph, 'num_node_features') else self.node_feature_dim
+                    paper_features = torch.rand(num_papers, feature_dim, device=device)
+            else:
+                # Ensure paper_features is on the correct device
+                paper_features = self.to_device(paper_features)
+            
+            # Use autoregressive predictor to generate papers
+            temp = temperature if temperature is not None else self.temperature
+            generated_features, paper_info = self.autoregressive_predictor.generate_papers_autoregressively(
+                graph=past_graph,
+                node_embeddings=node_embeddings,
+                time_threshold=time_threshold,
+                future_window=future_window,
+                num_papers=num_papers,
+                paper_features=paper_features,
+                top_k=top_k,
+                threshold=threshold
+            )
+            
+            logger.info(f"Generated {num_papers} papers autoregressively with feature shape {generated_features.shape}")
+            return generated_features, paper_info
+            
+        except Exception as e:
+            logger.error(f"Error during autoregressive paper generation: {str(e)}")
+            logger.error(traceback.format_exc())
+            # Return minimal output to avoid breaking calling code
+            feature_dim = self.node_feature_dim if self.node_feature_dim is not None else self.embed_dim
+            empty_features = torch.zeros((num_papers, feature_dim), device=device)
+            empty_info = [{'index': i, 
+                           'feature': torch.zeros(feature_dim, device=device).cpu().numpy(),
+                           'timestamp': time_threshold + i * (future_window / num_papers),
+                           'citation_probs': np.zeros(graph.num_nodes),
+                           'citations': np.zeros(graph.num_nodes)} 
+                          for i in range(num_papers)]
+            return empty_features, empty_info
+    
+    def compute_link_prediction_loss(
+        self, 
+        graph: GraphData,
+        pos_edge_index: torch.Tensor,
+        neg_edge_index: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute loss for link prediction task.
+        
+        Args:
+            graph: Graph data object
+            pos_edge_index: Positive edge indices
+            neg_edge_index: Negative edge indices
+            
+        Returns:
+            Link prediction loss
+        """
+        # Move data to device
+        graph = self.to_device(graph)
+        pos_edge_index = self.to_device(pos_edge_index)
+        neg_edge_index = self.to_device(neg_edge_index)
+        
+        # Get node embeddings
+        node_embeddings = self.encoder(graph)
+        
+        # Get source and destination node embeddings for positive edges
+        src_pos, dst_pos = pos_edge_index
+        src_pos_embed = node_embeddings[src_pos]
+        dst_pos_embed = node_embeddings[dst_pos]
+        
+        # Get source and destination node embeddings for negative edges
+        src_neg, dst_neg = neg_edge_index
+        src_neg_embed = node_embeddings[src_neg]
+        dst_neg_embed = node_embeddings[dst_neg]
+        
+        # Predict links
+        pos_scores = self.predictor(src_pos_embed, dst_pos_embed)
+        neg_scores = self.predictor(src_neg_embed, dst_neg_embed)
+        
+        # Compute binary cross-entropy loss
+        pos_loss = F.binary_cross_entropy_with_logits(
+            pos_scores, 
+            torch.ones_like(pos_scores)
+        )
+        neg_loss = F.binary_cross_entropy_with_logits(
+            neg_scores, 
+            torch.zeros_like(neg_scores)
+        )
+        
+        # Combine positive and negative losses
+        link_pred_loss = (pos_loss + neg_loss) / 2
+        
+        return link_pred_loss
+    
+    def compute_autoregressive_loss(
+        self,
+        past_graph: GraphData,
+        future_graph: GraphData,
+        reveal_ratio: Optional[float] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Compute loss for autoregressive link prediction task.
+        
+        Args:
+            past_graph: Graph containing nodes before time threshold
+            future_graph: Graph containing nodes after time threshold
+            reveal_ratio: Proportion of links to reveal (overrides model default)
+            
+        Returns:
+            Tuple containing:
+            - Autoregressive prediction loss
+            - Dictionary of detailed loss components
+        """
+        metrics = {}
+        
+        logger.info("Starting compute_autoregressive_loss")
+        
+        try:
+            # If we don't have past and future graph, return zero loss
+            if past_graph is None or future_graph is None:
+                logger.info("No past or future graph provided, returning zero loss")
+                return torch.tensor(0.0, device=self.device), metrics
+            
+            # Get past embeddings
+            logger.info("Computing past graph embeddings")
+            past_embeddings = self.encoder(past_graph)
+            logger.info(f"Got past embeddings with shape {past_embeddings.shape}")
+            
+            # Initialize losses
+            logger.info("Initializing losses")
+            total_citation_loss = 0.0
+            num_processed_nodes = 0
+            
+            # Track metrics
+            total_accuracy = 0.0
+            total_precision = 0.0
+            total_recall = 0.0
+            total_f1 = 0.0
+            
+            # Batch size for processing future nodes to manage memory
+            batch_size = min(10, future_graph.num_nodes)  # Adjust this based on available memory
+            num_batches = (future_graph.num_nodes + batch_size - 1) // batch_size
+            
+            # For each batch of future nodes
+            logger.info(f"Processing {future_graph.num_nodes} future nodes in {num_batches} batches of size {batch_size}")
+            
+            if torch.cuda.is_available():
+                logger.info(f"CUDA Memory before processing: {torch.cuda.memory_allocated()/1024**2:.2f}MB allocated, {torch.cuda.memory_reserved()/1024**2:.2f}MB reserved")
+            
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min((batch_idx + 1) * batch_size, future_graph.num_nodes)
+                batch_nodes = list(range(start_idx, end_idx))
+                
+                logger.info(f"Processing batch {batch_idx+1}/{num_batches}, nodes {start_idx} to {end_idx-1}")
+                
+                if torch.cuda.is_available():
+                    logger.info(f"CUDA Memory at start of batch {batch_idx+1}: {torch.cuda.memory_allocated()/1024**2:.2f}MB allocated")
+                
+                # Process each node in the batch
+                for i in batch_nodes:
+                    try:
+                        logger.info(f"Processing future node {i+1}/{future_graph.num_nodes}")
+                        
+                        # Get node features
+                        node_feature = future_graph.x[i]
+                        logger.info(f"Node feature shape: {node_feature.shape}")
+                        
+                        # Find true citations between this future node and past nodes
+                        true_links = []
+                        
+                        # Get all outgoing edges from this future node
+                        try:
+                            src_indices, dst_indices = future_graph.edge_index
+                            for j in range(len(src_indices)):
+                                if src_indices[j] == i:  # If edge starts from current node
+                                    # Convert destination to past graph index if possible
+                                    dst = dst_indices[j]
+                                    if dst < past_graph.num_nodes:
+                                        true_links.append((i, dst))  # (src, dst) format
+                        
+                            logger.info(f"Found {len(true_links)} true links for future node {i}")
+                        except Exception as e:
+                            logger.error(f"Error processing edges for future node {i}: {str(e)}")
+                            continue
+                        
+                        # Create true link tensor if links exist
+                        revealed_links = None
+                        if len(true_links) > 0:
+                            # Convert to tensor
+                            true_links_tensor = torch.tensor(true_links, device=self.device)
+                            
+                            # Determine how many links to reveal
+                            effective_reveal_ratio = 0.5 if reveal_ratio is None else reveal_ratio
+                            num_to_reveal = max(1, int(len(true_links) * effective_reveal_ratio))
+                            logger.info(f"Revealing {num_to_reveal} out of {len(true_links)} links")
+                            
+                            # Randomly select links to reveal
+                            try:
+                                revealed_links = self.autoregressive_predictor._select_revealed_links(
+                                    true_links_tensor, num_to_reveal
+                                )
+                                logger.info(f"Selected {len(revealed_links)} links to reveal")
+                            except Exception as e:
+                                logger.error(f"Error selecting revealed links: {str(e)}")
+                                # Handle the error gracefully
+                                revealed_links = None
+                        else:
+                            logger.info("No true links for this node - will train with all negative targets")
+                        
+                        # Predict links autoregressively
+                        logger.info("Predicting links autoregressively")
+                        link_probs, link_predictions = self.autoregressive_predictor.predict_links_autoregressively(
+                            past_graph,
+                            past_embeddings,
+                            masked_node_index=i,
+                            node_features=node_feature.unsqueeze(0),  # Add batch dimension
+                            revealed_links=revealed_links
+                        )
+                        
+                        logger.info(f"Got link predictions with shape {link_predictions.shape}")
+                        
+                        # Create true labels tensor
+                        # All links are considered negative initially
+                        true_labels = torch.zeros(past_graph.num_nodes, device=self.device)
+                        
+                        # Set positive links based on true_links
+                        if len(true_links) > 0:
+                            for _, dst in true_links:
+                                if dst < true_labels.size(0):
+                                    true_labels[dst] = 1.0
+                        
+                        # Reshape true_labels to match link_probs shape if needed
+                        if link_probs.dim() > 1 and true_labels.dim() == 1:
+                            logger.info(f"Reshaping true_labels from {true_labels.shape} to match link_probs shape {link_probs.shape}")
+                            true_labels = true_labels.view(-1, 1)
+                        
+                        # Compute loss - use binary cross entropy
+                        citation_loss = F.binary_cross_entropy(link_probs, true_labels)
+                        logger.info(f"Citation loss: {citation_loss.item()}")
+                        
+                        # Accumulate loss
+                        total_citation_loss += citation_loss.item()
+                        num_processed_nodes += 1
+                        
+                        # Compute metrics
+                        # Convert probabilities to binary predictions
+                        binary_preds = (link_probs > 0.5).float()
+                        
+                        # Compute metrics if we have valid predictions
+                        if binary_preds.numel() > 0 and true_labels.numel() > 0:
+                            # Accuracy
+                            accuracy = (binary_preds == true_labels).float().mean().item()
+                            total_accuracy += accuracy
+                            
+                            # Precision, recall, F1
+                            try:
+                                # Convert to CPU for sklearn metrics
+                                y_true = true_labels.cpu().numpy().flatten()
+                                y_pred = binary_preds.cpu().numpy().flatten()
+                                
+                                if np.sum(y_true) > 0 and np.sum(y_pred) > 0:
+                                    precision = precision_score(y_true, y_pred, zero_division=0)
+                                    recall = recall_score(y_true, y_pred, zero_division=0)
+                                    f1 = f1_score(y_true, y_pred, zero_division=0)
+                                    
+                                    total_precision += precision
+                                    total_recall += recall
+                                    total_f1 += f1
+                            except Exception as e:
+                                logger.error(f"Error computing metrics: {str(e)}")
+                        
+                        # Release memory explicitly
+                        del link_probs, link_predictions, true_labels, node_feature
+                        if 'citation_loss' in locals():
+                            del citation_loss
+                        if 'true_links_tensor' in locals():
+                            del true_links_tensor
+                        if 'revealed_links' in locals():
+                            del revealed_links
+                        if 'binary_preds' in locals():
+                            del binary_preds
+                        
+                        # Clear CUDA cache if using GPU
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            
+                    except Exception as e:
+                        logger.error(f"Error processing future node {i}: {str(e)}")
+                        traceback.print_exc()
+                        continue
+                
+                # Clear unnecessary tensors after each batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            
+            logger.info(f"Processed {num_processed_nodes} nodes")
+            
+            # Calculate average loss
+            avg_citation_loss = total_citation_loss / max(1, num_processed_nodes)
+            
+            # Convert loss to tensor for backpropagation
+            loss_tensor = torch.tensor(avg_citation_loss, device=self.device, requires_grad=True)
+            
+            # Create metrics
+            metrics = {
+                'autoregressive': avg_citation_loss,
+                'val_autoregressive': avg_citation_loss,
+                'accuracy': total_accuracy / max(1, num_processed_nodes),
+                'precision': total_precision / max(1, num_processed_nodes),
+                'recall': total_recall / max(1, num_processed_nodes),
+                'f1': total_f1 / max(1, num_processed_nodes)
+            }
+            
+            return loss_tensor, metrics
+            
+        except Exception as e:
+            logger.error(f"Error computing autoregressive loss: {str(e)}")
+            traceback.print_exc()
+            # Return zero tensor with requires_grad=True to avoid breaking the autograd
+            return torch.tensor(0.0, device=self.device, requires_grad=True), metrics
+    
+    def compute_multi_task_loss(
+        self,
+        graph: GraphData,
+        pos_edge_index: torch.Tensor,
+        neg_edge_index: torch.Tensor,
+        past_graph: Optional[GraphData] = None,
+        future_graph: Optional[GraphData] = None,
+        task_weights: Dict[str, float] = {'link_prediction': 1.0, 'autoregressive': 1.0}
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute loss for multi-task learning.
+        
+        Args:
+            graph: Graph data object
+            pos_edge_index: Positive edge indices
+            neg_edge_index: Negative edge indices
+            past_graph: Graph containing nodes before time threshold
+            future_graph: Graph containing nodes after time threshold
+            task_weights: Dictionary of task weights
+            
+        Returns:
+            Dictionary of losses
+        """
+        device = next(self.parameters()).device
+        losses = {}
+        
+        # Compute link prediction loss if weight > 0
+        link_pred_weight = task_weights.get('link_prediction', 1.0)
+        if link_pred_weight > 0 and pos_edge_index is not None and neg_edge_index is not None:
+            link_pred_loss = self.compute_link_prediction_loss(
+                graph=graph,
+                pos_edge_index=pos_edge_index,
+                neg_edge_index=neg_edge_index
+            )
+            losses['link_prediction'] = link_pred_weight * link_pred_loss
+        else:
+            losses['link_prediction'] = torch.tensor(0.0, device=device)
+            
+        # Compute autoregressive loss if weight > 0
+        autoregressive_weight = task_weights.get('autoregressive', 1.0)
+        if autoregressive_weight > 0 and past_graph is not None and future_graph is not None:
+            autoregressive_loss, auto_metrics = self.compute_autoregressive_loss(
+                past_graph=past_graph,
+                future_graph=future_graph
+            )
+            losses['autoregressive'] = autoregressive_weight * autoregressive_loss
+            losses['auto_metrics'] = auto_metrics
+        else:
+            losses['autoregressive'] = torch.tensor(0.0, device=device)
+            
+        # Compute combined loss
+        combined_loss = sum(loss for name, loss in losses.items() 
+                           if isinstance(loss, torch.Tensor) and name != 'auto_metrics')
+        losses['combined'] = combined_loss
+        
+        return losses
+    
+    def train_step(
+        self,
+        graph: GraphData,
+        pos_edge_index: torch.Tensor,
+        neg_edge_index: torch.Tensor,
+        past_graph: Optional[GraphData] = None,
+        future_graph: Optional[GraphData] = None,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        task_weights: Dict[str, float] = {'link_prediction': 1.0, 'autoregressive': 1.0}
+    ) -> Dict[str, float]:
+        """
+        Training step for the model.
+        
+        Args:
+            graph: Graph data object
+            pos_edge_index: Positive edge indices
+            neg_edge_index: Negative edge indices
+            past_graph: Graph containing nodes before time threshold
+            future_graph: Graph containing nodes after time threshold
+            optimizer: Optimizer to use
+            task_weights: Dictionary of task weights
+            
+        Returns:
+            Dictionary of metrics
+        """
+        self.train()
+        
+        # Move data to device
+        graph = self.to_device(graph)
+        pos_edge_index = self.to_device(pos_edge_index)
+        neg_edge_index = self.to_device(neg_edge_index)
+        if past_graph is not None:
+            past_graph = self.to_device(past_graph)
+        if future_graph is not None:
+            future_graph = self.to_device(future_graph)
+            
+        # Compute losses
+        losses = self.compute_multi_task_loss(
+            graph=graph,
+            pos_edge_index=pos_edge_index,
+            neg_edge_index=neg_edge_index,
+            past_graph=past_graph,
+            future_graph=future_graph,
+            task_weights=task_weights
+        )
+        
+        # Optimization step if optimizer provided
+        if optimizer is not None:
+            optimizer.zero_grad()
+            losses['combined'].backward()
+            optimizer.step()
+            self.update_counter += 1
+            
+        # Convert losses to float for logging
+        metrics = {k: v.item() if isinstance(v, torch.Tensor) else v
+                  for k, v in losses.items()}
+        
+        # Add autoregressive metrics
+        if 'auto_metrics' in losses:
+            for k, v in losses['auto_metrics'].items():
+                metrics[f'auto_{k}'] = v
+            metrics.pop('auto_metrics', None)
+            
+        return metrics
+    
+    def validation_step(
+        self,
+        graph: GraphData,
+        val_pos_edge_index: torch.Tensor,
+        val_neg_edge_index: torch.Tensor,
+        val_past_graph: Optional[GraphData] = None,
+        val_future_graph: Optional[GraphData] = None,
+        task_weights: Dict[str, float] = {'link_prediction': 1.0, 'autoregressive': 1.0}
+    ) -> Dict[str, float]:
+        """
+        Validation step for the model.
+        
+        Args:
+            graph: Graph data object
+            val_pos_edge_index: Positive edge indices for validation
+            val_neg_edge_index: Negative edge indices for validation
+            val_past_graph: Past graph for validation
+            val_future_graph: Future graph for validation
+            task_weights: Dictionary of task weights
+            
+        Returns:
+            Dictionary of validation metrics
+        """
+        self.eval()
+        
+        # Move data to device
+        graph = self.to_device(graph)
+        val_pos_edge_index = self.to_device(val_pos_edge_index)
+        val_neg_edge_index = self.to_device(val_neg_edge_index)
+        if val_past_graph is not None:
+            val_past_graph = self.to_device(val_past_graph)
+        if val_future_graph is not None:
+            val_future_graph = self.to_device(val_future_graph)
+            
+        # Compute validation losses
+        with torch.no_grad():
+            losses = self.compute_multi_task_loss(
+                graph=graph,
+                pos_edge_index=val_pos_edge_index,
+                neg_edge_index=val_neg_edge_index,
+                past_graph=val_past_graph,
+                future_graph=val_future_graph,
+                task_weights=task_weights
+            )
+            
+        # Convert losses to float for logging
+        metrics = {k: v.item() if isinstance(v, torch.Tensor) else v
+                  for k, v in losses.items()}
+        
+        # Add autoregressive metrics
+        if 'auto_metrics' in losses:
+            for k, v in losses['auto_metrics'].items():
+                metrics[f'auto_{k}'] = v
+            metrics.pop('auto_metrics', None)
+            
+        # Add prefix to metrics
+        metrics = {'val_' + k: v for k, v in metrics.items()}
+        
+        return metrics
+    
+    def compute_link_prediction_metrics(
+        self,
+        graph: GraphData,
+        pos_edge_index: torch.Tensor,
+        neg_edge_index: torch.Tensor
+    ) -> Dict[str, float]:
+        """
+        Compute metrics for link prediction task.
+        
+        Args:
+            graph: Graph data object
+            pos_edge_index: Positive edge indices
+            neg_edge_index: Negative edge indices
+            
+        Returns:
+            Dictionary of metrics
+        """
+        self.eval()
+        
+        # Move data to device
+        graph = self.to_device(graph)
+        pos_edge_index = self.to_device(pos_edge_index)
+        neg_edge_index = self.to_device(neg_edge_index)
+        
+        # Get node embeddings
+        with torch.no_grad():
+            node_embeddings = self.encoder(graph)
+            
+            # Get source and destination node embeddings for positive edges
+            src_pos, dst_pos = pos_edge_index
+            src_pos_embed = node_embeddings[src_pos]
+            dst_pos_embed = node_embeddings[dst_pos]
+            
+            # Get source and destination node embeddings for negative edges
+            src_neg, dst_neg = neg_edge_index
+            src_neg_embed = node_embeddings[src_neg]
+            dst_neg_embed = node_embeddings[dst_neg]
+            
+            # Predict links
+            pos_scores = self.predictor(src_pos_embed, dst_pos_embed)
+            neg_scores = self.predictor(src_neg_embed, dst_neg_embed)
+            
+            # Apply sigmoid to get probabilities
+            pos_probs = torch.sigmoid(pos_scores)
+            neg_probs = torch.sigmoid(neg_scores)
+            
+            # Convert to numpy for metric computation
+            pos_probs_np = pos_probs.cpu().numpy()
+            neg_probs_np = neg_probs.cpu().numpy()
+            
+            # Concatenate scores and create labels
+            scores = np.concatenate([pos_probs_np, neg_probs_np])
+            labels = np.concatenate([np.ones_like(pos_probs_np), np.zeros_like(neg_probs_np)])
+            
+            # Compute metrics
+            # ROC AUC
+            roc_auc = roc_auc_score(labels, scores)
+            
+            # Average precision
+            ap = average_precision_score(labels, scores)
+            
+            # Binary predictions using threshold 0.5
+            binary_preds = (scores >= 0.5).astype(np.float32)
+            
+            # True positives, false positives, false negatives
+            tp = np.sum((binary_preds == 1) & (labels == 1))
+            fp = np.sum((binary_preds == 1) & (labels == 0))
+            fn = np.sum((binary_preds == 0) & (labels == 1))
+            
+            # Precision, recall, F1
+            precision = tp / (tp + fp + 1e-10)
+            recall = tp / (tp + fn + 1e-10)
+            f1 = 2 * precision * recall / (precision + recall + 1e-10)
+            
+            # Accuracy
+            accuracy = np.mean(binary_preds == labels)
+            
+            # Metrics for different thresholds
+            metrics = {
+                'roc_auc': roc_auc,
+                'ap': ap,
+                'accuracy': accuracy,
+                'precision': precision,
+                'recall': recall,
+                'f1': f1
+            }
+            
+            # Add precision@k for k in [1, 5, 10]
+            for k in [1, 5, 10]:
+                metrics[f'precision@{k}'] = self.compute_precision_at_k(scores, labels, k)
+                
+            return metrics
+    
+    def compute_precision_at_k(
+        self,
+        scores: np.ndarray,
+        labels: np.ndarray,
+        k: int
+    ) -> float:
+        """
+        Compute precision@k metric.
+        
+        Args:
+            scores: Predicted scores
+            labels: True labels
+            k: Number of top predictions to consider
+            
+        Returns:
+            Precision@k value
+        """
+        # Sort by score
+        idx = np.argsort(scores)[::-1]
+        top_k_idx = idx[:k]
+        
+        # Compute precision
+        precision = np.mean(labels[top_k_idx])
+        
+        return precision
+    
+    def save(self, path: str) -> None:
+        """
+        Save model to file.
+        
+        Args:
+            path: Path to save model
+        """
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        
+        # Prepare state dict
+        state_dict = {
+            'model_state': self.state_dict(),
+            'model_config': {
+                'num_nodes': self.num_nodes,
+                'node_feature_dim': self.node_feature_dim,
+                'embed_dim': self.embed_dim,
+                'hidden_dim': self.hidden_dim,
+                'num_heads': self.num_heads,
+                'edge_dim': self.edge_dim,
+                'use_hierarchical': self.use_hierarchical,
+                'curvature': self.curvature,
+                'dropout': self.dropout,
+                'ordering_strategy': self.ordering_strategy,
+                'temperature': self.temperature,
+                'reveal_ratio': self.reveal_ratio
+            }
+        }
+        
+        torch.save(state_dict, path)
+        logger.info(f"Model saved to {path}")
+    
+    def load(self, path: str) -> None:
+        """
+        Load model from file.
+        
+        Args:
+            path: Path to load model from
+        """
+        state_dict = torch.load(path, map_location=self.device)
+        
+        # Update model config
+        if 'model_config' in state_dict:
+            config = state_dict['model_config']
+            for key, value in config.items():
+                if hasattr(self, key):
+                    setattr(self, key, value)
+                    
+        # Load model state
+        if 'model_state' in state_dict:
+            self.load_state_dict(state_dict['model_state'])
+        else:
+            self.load_state_dict(state_dict)
+            
+        logger.info(f"Model loaded from {path}")
+    
+    @classmethod
+    def from_pretrained(cls, path: str) -> 'AutoregressiveCitationModel':
+        """
+        Load model from pretrained file.
+        
+        Args:
+            path: Path to load model from
+            
+        Returns:
+            Loaded model
+        """
+        state_dict = torch.load(path, map_location='cpu')
+        
+        # Get model config
+        config = state_dict.get('model_config', {})
+        
+        # Create model
+        model = cls(**config)
+        
+        # Load state dict
+        if 'model_state' in state_dict:
+            model.load_state_dict(state_dict['model_state'])
+        else:
+            model.load_state_dict(state_dict)
+            
+        logger.info(f"Model loaded from {path}")
+        return model 
